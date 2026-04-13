@@ -1,4 +1,4 @@
-"""LibHunter / PHunter 外部工具调用：统一日志、工作目录与 subprocess 行为。"""
+"""LibHunter / PHunter 工具调用：统一日志、工作目录与 subprocess 行为。"""
 from __future__ import annotations
 
 import hashlib
@@ -66,6 +66,11 @@ _PHUNTER_RESOURCE_LIMIT_PATTERN = re.compile(
 _PHUNTER_FATAL_PATTERN = re.compile(
     r"(failed\s+to\s+parse\s+command-line\s+arguments|the\s+analysis\s+has\s+failed)",
     re.IGNORECASE,
+)
+_LIBHUNTER_NOISY_TERMINAL_PATTERNS = (
+    re.compile(r"Multiple exit nodes found !", re.IGNORECASE),
+    re.compile(r"Unknown instruction\s*:\s*.+invalid_instruction", re.IGNORECASE),
+    re.compile(r"Error loading/building lib .*unpack requires a buffer of 4 bytes", re.IGNORECASE),
 )
 _STAGE_TOKEN_PATTERN = re.compile(r"(^|[^a-z0-9])(pre|post)([^a-z0-9]|$)", re.IGNORECASE)
 
@@ -267,20 +272,46 @@ def run_logged_command(
     memory_limit_bytes: int = 0,
     stdout_log: Path,
     stderr_log: Path,
+    suppress_terminal_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> CommandResult:
-    """执行子进程并将完整输出写入指定日志文件。"""
+
+    stdout_log.parent.mkdir(parents=True, exist_ok=True)
+    stderr_log.parent.mkdir(parents=True, exist_ok=True)
+    stdout_log.write_text("", encoding="utf-8")
+    stderr_log.write_text("", encoding="utf-8")
+
+    def _append(log_path: Path, line: str) -> None:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+    def _should_echo(line: str) -> bool:
+        if not stream_output:
+            return False
+        return not any(p.search(line) for p in suppress_terminal_patterns)
+
+    def _on_stdout(line: str) -> None:
+        _append(stdout_log, line)
+        if _should_echo(line):
+            print(line, flush=True)
+
+    def _on_stderr(line: str) -> None:
+        _append(stderr_log, line)
+        if _should_echo(line):
+            print(line, flush=True)
+
     result = run_command(
         cmd,
         cwd=cwd,
         timeout=timeout,
         env=env,
-        stream_output=stream_output,
+        # Echo is handled in callbacks so we can filter noisy lines.
+        stream_output=False,
         raise_on_error=False,
+        on_stdout_line=_on_stdout,
+        on_stderr_line=_on_stderr,
         heartbeat_timeout=heartbeat_timeout,
         memory_limit_bytes=memory_limit_bytes,
     )
-    _write_text(stdout_log, result.stdout)
-    _write_text(stderr_log, result.stderr)
     return result
 
 
@@ -361,7 +392,7 @@ def prewarm_tpl_pickles(*, env: Dict[str, str], timeout: int) -> CommandResult:
         cwd=LIBHUNTER_DIR,
         timeout=timeout,
         env=env,
-        stream_output=True,
+        stream_output=False,
         # 预热阶段可能长时间无输出，不应按心跳静默误判卡死
         heartbeat_timeout=0,
         stdout_log=LOG_DIR / "libhunter_prewarm.stdout.log",
@@ -471,6 +502,7 @@ def run_libhunter(apk_path: str | Path) -> dict:
         heartbeat_timeout=LIBHUNTER_HEARTBEAT_TIMEOUT,
         stdout_log=LOG_DIR / f"libhunter_{apk_path.stem}.stdout.log",
         stderr_log=LOG_DIR / f"libhunter_{apk_path.stem}.stderr.log",
+        suppress_terminal_patterns=_LIBHUNTER_NOISY_TERMINAL_PATTERNS,
     )
 
     # 如果命令“卡死”
