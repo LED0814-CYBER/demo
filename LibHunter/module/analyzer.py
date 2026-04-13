@@ -18,6 +18,7 @@ import networkx as nx
 from tqdm import tqdm
 
 from apk import Apk
+from coarse_filter import CoarseFilterConfig, CoarseFilterEngine, build_lib_groups
 from lh_config import (class_similar, lib_similar, max_thread_num, method_similar, pickle_dir,
                     listener_process, worker_init, setup_logger)
 from lib import ThirdLib
@@ -992,6 +993,49 @@ def _init_detect_worker(apk_pickle_path: str):
         _DETECT_APK_OBJ = pickle.load(file)
 
 
+def _init_coarse_engine(lib_dex_folder: str, lib_groups: dict, logger):
+    config = CoarseFilterConfig.from_env()
+    if not config.enabled:
+        return None
+
+    coarse_engine = CoarseFilterEngine(
+        lib_dex_folder=lib_dex_folder,
+        load_lib_obj=lambda rel_path: _load_or_build_lib_obj(lib_dex_folder, rel_path, logger),
+        logger=logger,
+        config=config,
+    )
+    stats = coarse_engine.ensure_index(lib_groups)
+    logger.info(
+        "[libhunter] Coarse index ready: total=%d reused=%d rebuilt=%d elapsed=%dms",
+        stats.get("total_families", 0),
+        stats.get("reused_families", 0),
+        stats.get("rebuilt_families", 0),
+        stats.get("elapsed_ms", 0),
+    )
+    return coarse_engine
+
+
+def _log_coarse_metrics(logger, metrics: dict):
+    total_groups = metrics.get("coarse_total_groups", 0)
+    candidate_groups = metrics.get("coarse_candidate_groups", 0)
+    prune_ratio = metrics.get("coarse_prune_ratio", 0.0)
+    elapsed_ms = metrics.get("coarse_elapsed_ms", 0)
+    fallback_triggered = metrics.get("fallback_triggered", False)
+
+    logger.info("[libhunter] coarse_total_groups=%d", total_groups)
+    logger.info("[libhunter] coarse_candidate_groups=%d", candidate_groups)
+    logger.info("[libhunter] coarse_prune_ratio=%.4f", prune_ratio)
+    logger.info("[libhunter] coarse_elapsed_ms=%d", elapsed_ms)
+    logger.info("[libhunter] fallback_triggered=%s", fallback_triggered)
+    logger.info(
+        "[libhunter] Coarse filter: %d -> %d groups (pruned %.1f%%), %dms",
+        total_groups,
+        candidate_groups,
+        prune_ratio * 100.0,
+        elapsed_ms,
+    )
+
+
 # ==========================================
 # 新增：启发式剪枝核心：基于 prematch 的探针检测任务
 # ==========================================
@@ -1101,18 +1145,8 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
     LOGGER.debug("Starting to extract all library information...")
     time_start = datetime.datetime.now()
     
-    lib_groups = {}
-    libs_list = []
-    
-    # 遍历嵌套目录: data/tpl_dex/<lib_name>/<versions>.dex
-    for item in os.listdir(lib_dex_folder):
-        item_path = os.path.join(lib_dex_folder, item)
-        if os.path.isdir(item_path):
-            base_name = item
-            versions = [f"{base_name}/{f}" for f in os.listdir(item_path) if f.endswith('.dex')]
-            if versions:
-                lib_groups[base_name] = versions
-                libs_list.extend(versions)
+    lib_groups = build_lib_groups(lib_dex_folder)
+    libs_list = [lib for versions in lib_groups.values() for lib in versions]
 
     libs = list(libs_list)  # 用于兼容后面的代码
     random.shuffle(libs)
@@ -1136,6 +1170,13 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
     all_libs_num = len(libs_list)
     LOGGER.info("The number of libraries analyzed this time is: %d", all_libs_num)
 
+    coarse_engine = None
+    try:
+        coarse_engine = _init_coarse_engine(lib_dex_folder, lib_groups, LOGGER)
+    except Exception as e:
+        LOGGER.error("[libhunter] coarse index initialization failed, fallback to full scan: %s", e)
+        coarse_engine = None
+
     for apk in os.listdir(apk_folder):
         print("start analyzing: ", apk)
         LOGGER.info("Starting analysis: %s", apk)
@@ -1149,7 +1190,7 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
             else:
                 # 读取一次用于提前校验 pickle 是否可用
                 with open(apk_pickle_path, 'rb') as file:
-                    pickle.load(file)
+                    apk_obj = pickle.load(file)
         except Exception as e:
             LOGGER.error("Error in decompile apk: %s", e)
             continue
@@ -1157,41 +1198,25 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
         global_finished_jar_dict = {}
 
         if len(libs_list) > 0:
-            # ==========================================
-            # 阶段 1: 探针检测 (基于 prematch 和目录结构)
-            # ==========================================
-            probe_tasks = []
-            for base_name, versions in lib_groups.items():
-                versions.sort()
-                probe_lib = versions[-1] # 选择字典序最大的版本作为探针
-                probe_tasks.append((lib_dex_folder, probe_lib, base_name))
+            matched_groups = set(lib_groups.keys())
+            coarse_metrics = {
+                "coarse_total_groups": len(lib_groups),
+                "coarse_candidate_groups": len(matched_groups),
+                "coarse_prune_ratio": 0.0,
+                "coarse_elapsed_ms": 0,
+                "fallback_triggered": False,
+            }
+            if coarse_engine is not None:
+                matched_groups, coarse_metrics = coarse_engine.select_candidate_groups(apk_obj, lib_groups)
+            _log_coarse_metrics(LOGGER, coarse_metrics)
 
-            matched_groups = set()
-            LOGGER.info(f"[*] 开启启发式剪枝: 正在对 {len(probe_tasks)} 个组件族进行 Prematch 探针筛选...")
-
-            with Pool(processes=thread_num, initializer=_init_detect_worker, initargs=(apk_pickle_path,)) as pool:
-                for base_name, is_suspected in tqdm(
-                    pool.imap_unordered(_probe_group_task, probe_tasks),
-                    total=len(probe_tasks),
-                    desc=f"Probe {apk}",
-                    colour='yellow'
-                ):
-                    if is_suspected:
-                        matched_groups.add(base_name)
-
-            skipped_groups = len(lib_groups) - len(matched_groups)
-            LOGGER.info(f"[-] 探针筛选完毕: 跳过 {skipped_groups} 个无关组件族。")
-            
-            # ==========================================
-            # 阶段 2: 命中族群的全版本深度检测
-            # ==========================================
             detect_tasks = []
             for base_name in matched_groups:
                 for lib in lib_groups[base_name]:
                     detect_tasks.append((lib_dex_folder, lib))
 
             if len(detect_tasks) > 0:
-                LOGGER.info(f"[+] 发现 {len(matched_groups)} 个疑似组件族，准备对剩余 {len(detect_tasks)} 个版本进行细筛...")
+                LOGGER.info(f"[+] 进入细筛组件族: {len(matched_groups)}，版本任务数: {len(detect_tasks)}")
                 with Pool(
                     processes=thread_num,
                     initializer=_init_detect_worker,
@@ -1246,17 +1271,8 @@ def search_libs_in_app(lib_dex_folder=None,
     LOGGER.debug("Starting to extract all library information...")
     time_start = datetime.datetime.now()
     
-    lib_groups = {}
-    libs_list = []
-    
-    for item in os.listdir(lib_dex_folder):
-        item_path = os.path.join(lib_dex_folder, item)
-        if os.path.isdir(item_path):
-            base_name = item
-            versions = [f"{base_name}/{f}" for f in os.listdir(item_path) if f.endswith('.dex')]
-            if versions:
-                lib_groups[base_name] = versions
-                libs_list.extend(versions)
+    lib_groups = build_lib_groups(lib_dex_folder)
+    libs_list = [lib for versions in lib_groups.values() for lib in versions]
 
     libs = list(libs_list)
     random.shuffle(libs)
@@ -1319,6 +1335,13 @@ def search_libs_in_app(lib_dex_folder=None,
         all_libs_num = len(libs_list)
         LOGGER.info("The number of libraries analyzed this time is: %d", all_libs_num)
 
+        coarse_engine = None
+        try:
+            coarse_engine = _init_coarse_engine(lib_dex_folder, lib_groups, LOGGER)
+        except Exception as e:
+            LOGGER.error("[libhunter] coarse index initialization failed, fallback to full scan: %s", e)
+            coarse_engine = None
+
         global_apk_info_dict = manager.dict()
         for apk in os.listdir(apk_folder):
 
@@ -1345,42 +1368,20 @@ def search_libs_in_app(lib_dex_folder=None,
 
             global_finished_jar_dict = manager.dict()
 
-            # ==========================================
-            # Legacy Mode: 探针预筛阶段
-            # ==========================================
-            shared_matched_groups = manager.dict()
-            probe_libs = []
-            base_name_mapping = {}
-            for base_name, versions in lib_groups.items():
-                versions.sort()
-                probe_lib = versions[-1] # 选择最新版本探针
-                probe_libs.append(probe_lib)
-                base_name_mapping[probe_lib] = base_name
+            matched_groups = set(lib_groups.keys())
+            coarse_metrics = {
+                "coarse_total_groups": len(lib_groups),
+                "coarse_candidate_groups": len(matched_groups),
+                "coarse_prune_ratio": 0.0,
+                "coarse_elapsed_ms": 0,
+                "fallback_triggered": False,
+            }
+            if coarse_engine is not None:
+                matched_groups, coarse_metrics = coarse_engine.select_candidate_groups(apk_obj, lib_groups)
+            _log_coarse_metrics(LOGGER, coarse_metrics)
 
-            LOGGER.info(f"[*] 开启启发式剪枝(Legacy): 正在对 {len(probe_libs)} 个组件族进行探针预筛...")
-
-            process_probe_partial = partial(sub_probe_lib_legacy, apk=apk, global_apk_info_dict=global_apk_info_dict,
-                                          global_lib_info_dict=global_lib_info_dict,
-                                          shared_matched_groups=shared_matched_groups,
-                                          base_name_mapping=base_name_mapping)
-            log_queue_probe = manager.Queue()
-            listener_probe = Process(target=listener_process, args=(log_queue_probe,))
-            listener_probe.start()
-            with Pool(processes=thread_num, initializer=worker_init, initargs=(log_queue_probe,)) as pool:
-                list(tqdm(pool.imap(process_probe_partial, probe_libs), total=len(probe_libs), desc=f"Probe {apk}", colour='yellow'))
-                pool.close()
-                pool.join()
-            log_queue_probe.put(None)
-            listener_probe.join()
-
-            skipped_groups = len(lib_groups) - len(shared_matched_groups)
-            LOGGER.info(f"[-] 探针筛选完毕: 跳过 {skipped_groups} 个无关组件族。")
-
-            # ==========================================
-            # Legacy Mode: 全量细筛阶段
-            # ==========================================
             detect_libs = []
-            for base_name in shared_matched_groups.keys():
+            for base_name in matched_groups:
                 detect_libs.extend(lib_groups[base_name])
 
             process_lib_partial = partial(sub_detect_lib, apk=apk, global_apk_info_dict=global_apk_info_dict,
@@ -1388,7 +1389,7 @@ def search_libs_in_app(lib_dex_folder=None,
                                           global_lib_info_dict=global_lib_info_dict)
 
             if len(detect_libs) > 0:
-                LOGGER.info(f"[+] 准备对剩余 {len(detect_libs)} 个版本进行细筛...")
+                LOGGER.info(f"[+] 进入细筛组件族: {len(matched_groups)}，版本任务数: {len(detect_libs)}")
                 log_queue3 = manager.Queue()
                 listener3 = Process(target=listener_process, args=(log_queue3,))
                 listener3.start()
