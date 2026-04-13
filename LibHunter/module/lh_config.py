@@ -6,7 +6,9 @@ import os.path
 from pathlib import Path
 
 # ── 运行参数 ──────────────────────────────────────────────────
-max_thread_num = multiprocessing.cpu_count()
+# Default to half of system CPUs (env override still supported).
+_CPU_COUNT = multiprocessing.cpu_count() or 1
+max_thread_num = int(os.environ.get("LH_MAX_THREAD_NUM", str(max(1, _CPU_COUNT // 2))))
 
 # ── pickle 缓存目录[预热] ──
 pickle_dir = os.environ.get("LH_PICKLE_DIR", "").strip()
