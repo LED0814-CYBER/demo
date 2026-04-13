@@ -2,42 +2,36 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
-import uuid
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from config import INPUT_DIR, LOG_DIR, REPORT_DIR, ensure_runtime_dirs
-from main import analyze_apk_async
-
-
-@dataclass
-class AnalyzeTask:
-    task_id: str
-    apk_name: str
-    apk_path: str
-    apk_stem: str
-    status: str = "queued"
-    started_at: Optional[float] = None
-    ended_at: Optional[float] = None
-    report_path: Optional[str] = None
-    error: Optional[str] = None
+from backend.db import SessionLocal, get_db, init_db
+from backend.models import AnalysisTask, User, VulnerabilityReport
+from backend.settings import settings
+from backend.tasks import run_analysis_task
+from config import ensure_runtime_dirs
 
 
 class AnalyzeRequest(BaseModel):
     filename: Optional[str] = None
+    user_id: Optional[str] = None
 
 
-app = FastAPI(title="APK Vulnerability Scanner API", version="1.0.0")
+class AnalyzeTaskCreateRequest(BaseModel):
+    filename: str
+    user_id: Optional[str] = None
 
-# Dev-friendly CORS. If you have a fixed frontend origin, tighten this list.
+
+app = FastAPI(title="APK Vulnerability Scanner API", version="2.0.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,13 +40,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ensure_runtime_dirs()
-
-_tasks: dict[str, AnalyzeTask] = {}
-_task_lock = asyncio.Lock()
-_current_task_id: Optional[str] = None
-_latest_uploaded_filename: Optional[str] = None
 _frontend_dist = Path(__file__).resolve().parent / "frontend" / "dist"
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    ensure_runtime_dirs()
+    settings.ensure_runtime_dirs()
+    init_db()
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -64,79 +59,129 @@ def _sanitize_filename(filename: str) -> str:
 
 def _resolve_apk_path(filename: str) -> Path:
     safe_name = _sanitize_filename(filename)
-    apk_path = (INPUT_DIR / safe_name).resolve()
-    if apk_path.parent != INPUT_DIR.resolve():
+    apk_path = (settings.upload_dir / safe_name).resolve()
+    if apk_path.parent != settings.upload_dir.resolve():
         raise HTTPException(status_code=400, detail="Invalid filename")
     if not apk_path.exists() or not apk_path.is_file():
         raise HTTPException(status_code=404, detail=f"APK not found: {safe_name}")
     return apk_path
 
 
-def _task_snapshot(task: AnalyzeTask) -> dict:
-    return asdict(task)
+def _serialize_task(task: AnalysisTask) -> dict:
+    return {
+        "task_id": task.id,
+        "apk_name": task.apk_name,
+        "apk_path": task.apk_path,
+        "status": task.status,
+        "celery_task_id": task.celery_task_id,
+        "report_path": task.report_path,
+        "stdout_log_path": task.stdout_log_path,
+        "stderr_log_path": task.stderr_log_path,
+        "error": task.error_message,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+    }
 
 
-def _latest_completed_task() -> Optional[AnalyzeTask]:
-    completed = [t for t in _tasks.values() if t.status == "completed" and t.ended_at is not None]
-    if not completed:
-        return None
-    return max(completed, key=lambda t: t.ended_at or 0)
+def _get_or_create_default_user(db: Session) -> User:
+    user = db.scalar(select(User).where(User.username == "default"))
+    if user is not None:
+        return user
+    user = User(username="default")
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
 
-def _collect_task_logs(task: AnalyzeTask) -> list[Path]:
-    candidates = [path for path in LOG_DIR.glob(f"*{task.apk_stem}*.log") if path.is_file()]
-    if task.started_at is not None:
-        threshold = task.started_at - 2
-        filtered: list[Path] = []
-        for path in candidates:
-            try:
-                if path.stat().st_mtime >= threshold:
-                    filtered.append(path)
-            except OSError:
-                continue
-        candidates = filtered
+def _enqueue_analysis(db: Session, apk_path: Path, user_id: str | None) -> AnalysisTask:
+    if user_id:
+        user = db.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail=f"User not found: {user_id}")
+    else:
+        user = _get_or_create_default_user(db)
 
-    return sorted(
-        candidates,
-        key=lambda p: (p.stat().st_mtime if p.exists() else 0, p.name),
+    task = AnalysisTask(
+        user_id=user.id,
+        apk_name=apk_path.name,
+        apk_path=str(apk_path),
+        status="queued",
     )
-
-
-async def _run_analysis(task_id: str) -> None:
-    global _current_task_id
-    task = _tasks[task_id]
-    task.status = "running"
-    task.started_at = time.time()
+    db.add(task)
+    db.commit()
+    db.refresh(task)
 
     try:
-        result = await analyze_apk_async(task.apk_path, print_summary=False)
-        task.report_path = result.get("report_path")
-        task.status = "completed"
+        async_result = run_analysis_task.delay(task.id, str(apk_path))
     except Exception as exc:
         task.status = "failed"
-        task.error = str(exc)
-    finally:
-        task.ended_at = time.time()
-        if _current_task_id == task_id:
-            _current_task_id = None
+        task.error_message = f"Failed to submit Celery task: {exc}"
+        db.commit()
+        db.refresh(task)
+        return task
+
+    task.celery_task_id = async_result.id
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def _latest_completed_task(db: Session) -> AnalysisTask | None:
+    stmt = (
+        select(AnalysisTask)
+        .where(AnalysisTask.status == "completed")
+        .order_by(AnalysisTask.finished_at.desc())
+    )
+    return db.scalars(stmt).first()
+
+
+def _read_json_file(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Report not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid report JSON: {exc}") from exc
+
+
+def _candidate_log_files(task: AnalysisTask) -> list[Path]:
+    candidates: list[Path] = []
+    for path_text in (task.stdout_log_path, task.stderr_log_path):
+        if not path_text:
+            continue
+        path = Path(path_text)
+        if path.exists() and path.is_file():
+            candidates.append(path)
+
+    apk_stem = Path(task.apk_name).stem
+    for path in settings.log_dir.glob(f"*{apk_stem}*.log"):
+        if path.is_file():
+            candidates.append(path)
+
+    unique: dict[str, Path] = {str(path.resolve()): path for path in candidates}
+    return sorted(unique.values(), key=lambda p: p.name)
 
 
 @app.get("/api/health")
-async def health() -> dict:
-    return {"ok": True, "current_task_id": _current_task_id}
+def health() -> dict:
+    return {
+        "ok": True,
+        "database_url": settings.database_url,
+        "broker": settings.celery_broker_url,
+        "storage_dir": str(settings.storage_dir),
+    }
 
 
 @app.post("/api/upload")
 async def upload_apk(file: UploadFile = File(...)) -> dict:
-    global _latest_uploaded_filename
-
     filename = _sanitize_filename(file.filename or "")
     if Path(filename).suffix.lower() != ".apk":
         raise HTTPException(status_code=400, detail="Only .apk files are accepted")
 
-    INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    destination = (INPUT_DIR / filename).resolve()
-    if destination.parent != INPUT_DIR.resolve():
+    destination = (settings.upload_dir / filename).resolve()
+    if destination.parent != settings.upload_dir.resolve():
         raise HTTPException(status_code=400, detail="Invalid upload path")
 
     with destination.open("wb") as out:
@@ -147,8 +192,6 @@ async def upload_apk(file: UploadFile = File(...)) -> dict:
             out.write(chunk)
 
     await file.close()
-    _latest_uploaded_filename = filename
-
     return {
         "message": "Upload successful",
         "filename": filename,
@@ -158,80 +201,156 @@ async def upload_apk(file: UploadFile = File(...)) -> dict:
 
 
 @app.post("/api/analyze")
-async def analyze(request: AnalyzeRequest) -> dict:
-    global _current_task_id
-
-    requested_name = request.filename or _latest_uploaded_filename
-    if not requested_name:
-        raise HTTPException(status_code=400, detail="No APK specified and no uploaded APK found")
-
-    apk_path = _resolve_apk_path(requested_name)
-
-    async with _task_lock:
-        if _current_task_id and _tasks.get(_current_task_id) and _tasks[_current_task_id].status in {"queued", "running"}:
-            raise HTTPException(status_code=409, detail="Another analysis task is running")
-
-        task_id = uuid.uuid4().hex
-        task = AnalyzeTask(
-            task_id=task_id,
-            apk_name=apk_path.name,
-            apk_path=str(apk_path),
-            apk_stem=apk_path.stem,
-        )
-        _tasks[task_id] = task
-        _current_task_id = task_id
-        asyncio.create_task(_run_analysis(task_id))
-
+def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)) -> dict:
+    if not request.filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    apk_path = _resolve_apk_path(request.filename)
+    task = _enqueue_analysis(db, apk_path, request.user_id)
     return {
-        "message": "Analysis started",
-        "task": _task_snapshot(task),
+        "message": "Analysis queued",
+        "task": _serialize_task(task),
     }
 
 
+@app.post("/api/tasks")
+async def create_task_with_upload(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> dict:
+    upload_result = await upload_apk(file)
+    task = _enqueue_analysis(db, Path(upload_result["path"]), None)
+    return {"task": _serialize_task(task)}
+
+
+@app.post("/api/tasks/by-file")
+def create_task_by_filename(request: AnalyzeTaskCreateRequest, db: Session = Depends(get_db)) -> dict:
+    apk_path = _resolve_apk_path(request.filename)
+    task = _enqueue_analysis(db, apk_path, request.user_id)
+    return {"task": _serialize_task(task)}
+
+
 @app.get("/api/task/{task_id}")
-async def get_task(task_id: str) -> dict:
-    task = _tasks.get(task_id)
-    if not task:
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: str, db: Session = Depends(get_db)) -> dict:
+    task = db.get(AnalysisTask, task_id)
+    if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    return {"task": _task_snapshot(task)}
+    return {"task": _serialize_task(task)}
+
+
+@app.get("/api/tasks/{task_id}/report")
+def get_task_report(task_id: str, db: Session = Depends(get_db)) -> dict:
+    task = db.get(AnalysisTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Task not completed, current status: {task.status}")
+
+    report = task.report
+    if report and report.report_json is not None:
+        return {
+            "task_id": task.id,
+            "report_path": report.report_path,
+            "report": report.report_json,
+        }
+
+    report_path = Path(task.report_path) if task.report_path else None
+    if not report_path:
+        raise HTTPException(status_code=404, detail="Report path missing")
+
+    report_json = _read_json_file(report_path)
+    return {
+        "task_id": task.id,
+        "report_path": str(report_path),
+        "report": report_json,
+    }
+
+
+@app.get("/api/report")
+def get_report(
+    task_id: Optional[str] = None,
+    apk_name: Optional[str] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    selected_task: AnalysisTask | None = None
+    report_path: Path | None = None
+
+    if task_id:
+        selected_task = db.get(AnalysisTask, task_id)
+        if selected_task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if not selected_task.report_path:
+            raise HTTPException(status_code=404, detail="Report not ready")
+        report_path = Path(selected_task.report_path)
+    elif apk_name:
+        safe_name = _sanitize_filename(apk_name)
+        report_path = settings.report_dir / f"{safe_name}_vuln_report.json"
+    else:
+        selected_task = _latest_completed_task(db)
+        if selected_task and selected_task.report_path:
+            report_path = Path(selected_task.report_path)
+
+    if report_path is None:
+        raise HTTPException(status_code=404, detail="Report file not found")
+
+    report_json = _read_json_file(report_path)
+
+    existing = None
+    if selected_task is not None:
+        existing = selected_task.report
+        if existing is None:
+            existing = VulnerabilityReport(
+                task_id=selected_task.id,
+                report_path=str(report_path),
+                report_json=report_json,
+            )
+            db.add(existing)
+        else:
+            existing.report_path = str(report_path)
+            existing.report_json = report_json
+        db.commit()
+
+    return {
+        "task_id": selected_task.id if selected_task else None,
+        "report_path": str(report_path),
+        "report": existing.report_json if existing else report_json,
+    }
 
 
 @app.websocket("/api/logs")
 async def websocket_logs(websocket: WebSocket, task_id: Optional[str] = None) -> None:
     await websocket.accept()
 
+    if not task_id:
+        await websocket.send_json({"type": "error", "message": "task_id is required"})
+        await websocket.close(code=1008)
+        return
+
+    offsets: dict[str, int] = {}
+    finished_idle_rounds = 0
+
     try:
-        task: Optional[AnalyzeTask]
-        if task_id:
-            task = _tasks.get(task_id)
-            if not task:
+        while True:
+            with SessionLocal() as db:
+                task = db.get(AnalysisTask, task_id)
+
+            if task is None:
                 await websocket.send_json({"type": "error", "message": f"Task not found: {task_id}"})
                 await websocket.close(code=1008)
                 return
-        else:
-            if _current_task_id and _current_task_id in _tasks:
-                task = _tasks[_current_task_id]
-            else:
-                task = _latest_completed_task()
 
-        if not task:
-            await websocket.send_json({"type": "error", "message": "No task available for log streaming"})
-            await websocket.close(code=1008)
-            return
+            if not offsets:
+                await websocket.send_json(
+                    {
+                        "type": "meta",
+                        "task_id": task.id,
+                        "apk_name": task.apk_name,
+                        "status": task.status,
+                    }
+                )
 
-        await websocket.send_json({
-            "type": "meta",
-            "task_id": task.task_id,
-            "apk_name": task.apk_name,
-            "status": task.status,
-        })
-
-        offsets: dict[str, int] = {}
-        finished_idle_rounds = 0
-
-        while True:
             had_new_data = False
-            for log_file in _collect_task_logs(task):
+            for log_file in _candidate_log_files(task):
                 key = str(log_file)
                 prev = offsets.get(key, 0)
                 try:
@@ -250,17 +369,19 @@ async def websocket_logs(websocket: WebSocket, task_id: Optional[str] = None) ->
                     chunk = handle.read()
                     offsets[key] = handle.tell()
 
-                if chunk:
-                    had_new_data = True
-                    for line in chunk.splitlines():
-                        await websocket.send_json(
-                            {
-                                "type": "log",
-                                "task_id": task.task_id,
-                                "file": log_file.name,
-                                "message": line,
-                            }
-                        )
+                if not chunk:
+                    continue
+
+                had_new_data = True
+                for line in chunk.splitlines():
+                    await websocket.send_json(
+                        {
+                            "type": "log",
+                            "task_id": task.id,
+                            "file": log_file.name,
+                            "message": line,
+                        }
+                    )
 
             if task.status in {"completed", "failed"}:
                 if had_new_data:
@@ -271,54 +392,17 @@ async def websocket_logs(websocket: WebSocket, task_id: Optional[str] = None) ->
                     await websocket.send_json(
                         {
                             "type": "done",
-                            "task_id": task.task_id,
+                            "task_id": task.id,
                             "status": task.status,
-                            "error": task.error,
+                            "error": task.error_message,
                             "report_path": task.report_path,
                         }
                     )
                     break
 
             await asyncio.sleep(0.8)
-
     except WebSocketDisconnect:
         return
-
-
-@app.get("/api/report")
-async def get_report(task_id: Optional[str] = None, apk_name: Optional[str] = None) -> dict:
-    report_path: Optional[Path] = None
-    selected_task_id: Optional[str] = task_id
-
-    if task_id:
-        task = _tasks.get(task_id)
-        if not task:
-            raise HTTPException(status_code=404, detail="Task not found")
-        if not task.report_path:
-            raise HTTPException(status_code=404, detail="Report not ready")
-        report_path = Path(task.report_path)
-    elif apk_name:
-        safe_name = _sanitize_filename(apk_name)
-        report_path = REPORT_DIR / f"{safe_name}_vuln_report.json"
-    else:
-        latest = _latest_completed_task()
-        if latest and latest.report_path:
-            selected_task_id = latest.task_id
-            report_path = Path(latest.report_path)
-
-    if not report_path or not report_path.exists():
-        raise HTTPException(status_code=404, detail="Report file not found")
-
-    try:
-        content = json.loads(report_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"Invalid report JSON: {exc}") from exc
-
-    return {
-        "task_id": selected_task_id,
-        "report_path": str(report_path),
-        "report": content,
-    }
 
 
 if _frontend_dist.exists():
@@ -341,18 +425,10 @@ async def serve_frontend(full_path: str):
         )
 
     target = (_frontend_dist / full_path).resolve()
-    if (
-        full_path
-        and target.exists()
-        and target.is_file()
-        and target.parent == _frontend_dist
-    ):
+    if full_path and target.exists() and target.is_file() and target.parent == _frontend_dist:
         return FileResponse(target)
 
     index_file = _frontend_dist / "index.html"
     if index_file.exists():
         return FileResponse(index_file)
     return JSONResponse({"detail": "Frontend entrypoint not found."}, status_code=503)
-
-
-# Start with: uvicorn app:app --host 0.0.0.0 --port 8000 --reload

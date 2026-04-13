@@ -1,0 +1,119 @@
+name: Android-hunter
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 用 uvicorn 启动 FastAPI，app:app 表示导入 app.py 里的 app 对象
+    # 监听 8000 端口，0.0.0.0 表示允许容器外部访问
+    command: uvicorn app:app --host 0.0.0.0 --port 8000
+    environment:
+      # 用 PostgreSQL，用户名 scanner，密码 scanner，数据库主机叫 postgres，端口 5432，数据库名 scannerdb
+      # postgres 不是随便写的，因为在 compose 里有一个服务名字就叫 postgres
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://scanner:scanner@postgres:5432/scannerdb}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      STORAGE_DIR: ${STORAGE_DIR:-/app/storage}
+      UPLOAD_DIR: ${UPLOAD_DIR:-/app/storage/uploads}
+      REPORT_DIR: ${REPORT_DIR:-/app/storage/reports}
+      LOG_DIR: ${LOG_DIR:-/app/storage/logs} # 这个地方是否要改成outputs/logs？因为现在日志是放在outputs里的
+      PHUNTER_CACHE_DIR: ${PHUNTER_CACHE_DIR:-/app/data/phunter_soot_cache}
+      LIBHUNTER_CACHE_DIR: ${LIBHUNTER_CACHE_DIR:-/app/data/lib_pickles_cache}
+      PYTHON_BIN: ${PYTHON_BIN:-python3}
+      JAVA_BIN: ${JAVA_BIN:-java}
+      ANDROID_JAR_PATH: ${ANDROID_JAR_PATH:-/app/PHunter/android-31/android.jar}
+      PHUNTER_JAR_PATH: ${PHUNTER_JAR_PATH:-/app/PHunter/PHunter.jar}
+      OUTPUT_DIR: ${OUTPUT_DIR:-/app/outputs}
+      RAW_DIR: ${RAW_DIR:-/app/outputs/raw}
+    ports:
+      # 宿主机端口:容器端口
+      # 你在服务器本机访问：http://localhost:8000，实际上就是访问到容器里的 FastAPI
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
+      - ./outputs:/app/outputs
+    depends_on:
+      # api 要等 redis 和 postgres 都健康后再启动
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 这表示启动一个 Celery worker。从 Redis 里拿任务，然后在后台执行耗时分析
+    # --concurrency=1，表示 worker 同时只开 1 个并发执行单元
+    command: celery -A backend.celery_app.celery_app worker --loglevel=info --concurrency=1
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://scanner:scanner@postgres:5432/scannerdb}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      STORAGE_DIR: ${STORAGE_DIR:-/app/storage}
+      UPLOAD_DIR: ${UPLOAD_DIR:-/app/storage/uploads}
+      REPORT_DIR: ${REPORT_DIR:-/app/storage/reports}
+      LOG_DIR: ${LOG_DIR:-/app/storage/logs}
+      PHUNTER_CACHE_DIR: ${PHUNTER_CACHE_DIR:-/app/data/phunter_soot_cache}
+      LIBHUNTER_CACHE_DIR: ${LIBHUNTER_CACHE_DIR:-/app/data/lib_pickles_cache}
+      PYTHON_BIN: ${PYTHON_BIN:-python3}
+      JAVA_BIN: ${JAVA_BIN:-java}
+      ANDROID_JAR_PATH: ${ANDROID_JAR_PATH:-/app/PHunter/android-31/android.jar}
+      PHUNTER_JAR_PATH: ${PHUNTER_JAR_PATH:-/app/PHunter/PHunter.jar}
+      OUTPUT_DIR: ${OUTPUT_DIR:-/app/outputs}
+      RAW_DIR: ${RAW_DIR:-/app/outputs/raw}
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
+      - ./outputs:/app/outputs
+    depends_on:
+      # worker 要等 redis 和 postgres 都健康后再启动
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  redis:
+    # 直接使用官方 Redis 镜像，不自己构建。
+    # redis:7-alpine = Redis 7 + Alpine 轻量系统版。体积小，启动快
+    image: redis:7-alpine
+    # --save 60 1：60 秒内有至少 1 次写入，就做一次持久化
+    # --loglevel warning：日志级别设为 warning，减少输出
+    command: redis-server --save 60 1 --loglevel warning
+    # 这里不是宿主机目录挂载，而是用命名卷 redis_data
+    # 意思是 Redis 的数据存放在 Docker 管理的持久化卷里，而不是容器临时层里
+    volumes:
+      - redis_data:/data
+    healthcheck:
+    # 这表示 Docker 会每 10 秒检查一次 Redis 是否健康
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    # 这表示数据库初始化时：数据库名：scannerdb；用户名：scanner；密码：scanner
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-scannerdb}
+      POSTGRES_USER: ${POSTGRES_USER:-scanner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scanner}
+    ports:
+      - "5432:5432"
+    volumes:
+    # 数据库的数据文件放在命名卷 postgres_data 中，避免容器删除后丢库
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scanner} -d ${POSTGRES_DB:-scannerdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# 声明两个命名卷
+volumes:
+  postgres_data:
+  redis_data:

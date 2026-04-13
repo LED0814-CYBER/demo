@@ -8,3 +8,7 @@ androguard==3.3.5
 fastapi
 uvicorn
 python-multipart
+celery[redis]
+SQLAlchemy
+psycopg2-binary
+python-dotenv
