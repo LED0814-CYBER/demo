@@ -1024,7 +1024,7 @@ def _probe_group_task(args):
     pre_match_rate = pre_match_opcodes / lib_opcode_num if lib_opcode_num > 0 else 0
 
     # 探针预筛阈值，直接与 lib_similar 对齐或设为 0.25 (取小者)
-    probe_threshold = min(0.25, lib_similar)
+    probe_threshold = 0.8
     is_suspected = pre_match_rate >= probe_threshold
     
     return base_name, is_suspected
@@ -1055,7 +1055,7 @@ def sub_probe_lib_legacy(lib, apk, global_apk_info_dict, global_lib_info_dict, s
 
     lib_opcode_num = lib_obj.lib_opcode_num
     pre_match_rate = pre_match_opcodes / lib_opcode_num if lib_opcode_num > 0 else 0
-    probe_threshold = min(0.25, lib_similar)
+    probe_threshold = 0.8
 
     if pre_match_rate >= probe_threshold:
         base_name = base_name_mapping[lib]
