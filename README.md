@@ -1,185 +1,129 @@
-# 本次更新总结：（详见飞书文档）
-## Docker Compose 后端启动（API + Worker + Redis + Postgres）
+# LibHunter 第一轮粗筛（Coarse Filter）说明
 
-### 1) 准备环境变量
+本文档说明当前 LibHunter 在精检前的首轮粗筛算法实现与使用方式。
+
+## 1. 目标
+
+- 在不改变 `detect` 输出格式的前提下，先做一轮高召回粗筛。
+- 降低后续精检的库族数量，控制总体耗时。
+- 默认策略以召回优先，剪枝率目标约 `80%`，并避免过严剪枝（不超过 `90%`）。
+
+## 2. 算法概览
+
+当前粗筛为“两路特征 + MinHash + LSH + 动态鲁棒重排”：
+
+1. 以 `family` 为单位聚合库版本（默认代表版本：latest + median + oldest，最多 3 个）。
+2. 提取两类特征：
+   - `str_tokens`：字符串常量特征
+   - `api_tokens`：外部 API 调用特征（含去噪）
+3. 族级指纹：
+   - `sig_str` = MinHash(`str_tokens`)
+   - `sig_api` = MinHash(`api_tokens`)
+4. 建两套 LSH：
+   - `lsh_str`
+   - `lsh_api`
+5. APK 查询：
+   - `initial = hit_str ∪ hit_api`
+6. 候选重排：
+   - 计算 `J_str`、`J_api`（由 MinHash 签名估计）
+   - `J_robust = w_str * J_str + w_api * J_api`
+   - 权重硬切换：
+     - 正常字符串质量：`w_str=0.5, w_api=0.5`
+     - 低质量字符串：`w_str=0.1, w_api=0.9`
+7. 保留规则：
+   - `keep_count = max(min_keep, ceil(total_groups * 0.2))`
+   - `keep_count = min(keep_count, ceil(total_groups * 0.9))`
+   - 按 `J_robust` 取前 `keep_count`
+   - 若为空且 `fallback_on_empty=true`，回退全量
+
+## 3. 去噪与质量检测
+
+### 3.1 API 去噪 `clean_api_features`
+
+- 黑名单过滤：如 `java.lang.*`、`java.util.*` 等高频通用簇
+- 白名单保留：如 `android.net.*`、`javax.crypto.*`、`android.hardware.*`、`android.telephony.*`、`android.media.*`
+- Family 维度高 DF 过滤：剔除跨家族高频 API token（可配置比例阈值）
+
+### 3.2 字符串质量检测 `check_string_quality`
+
+基于三类指标判断字符串是否低质量（疑似加密/乱码）：
+
+- 长字符串占比（`len > 5`）
+- 高熵字符串占比（Shannon entropy）
+- 可打印字符占比
+
+输出：
+
+- `q_str in [0,1]`
+- `is_low_quality`（是否触发降权）
+
+## 4. 缓存与索引
+
+系统运行时最关键的两类缓存：
+
+1. `data/lib_pickle_cache/*.pkl`
+   - 每个第三方库 dex 的 `ThirdLib` 解析对象缓存（含 `classes_dict`、`external_api_tokens`）
+2. `LibHunter/data/coarse_index/coarse_index.pkl`
+   - 族级压缩索引（签名、LSH、dex 元数据、配置快照）
+
+索引支持增量复用：
+
+- 若库文件 `size/mtime/hash` 未变化，则复用既有 family 索引；
+- 仅对变化的 family 重建。
+
+## 5. 关键配置（环境变量）
+
+- `LH_COARSE_ENABLED=true`
+- `LH_COARSE_MINHASH_PERM=128`
+- `LH_COARSE_LSH_BANDS=32`
+- `LH_COARSE_LSH_ROWS=4`
+- `LH_COARSE_MIN_KEEP=10`
+- `LH_COARSE_KEEP_RATIO=0.2`
+- `LH_COARSE_MAX_KEEP_RATIO=0.9`
+- `LH_COARSE_FALLBACK_ON_EMPTY=true`
+- `LH_COARSE_API_DF_RATIO=0.60`
+- `LH_COARSE_API_DF_MIN=12`
+- `LH_COARSE_ROBUST_W_STR=0.5`
+- `LH_COARSE_ROBUST_W_API=0.5`
+- `LH_COARSE_ROBUST_LOWQ_W_STR=0.1`
+- `LH_COARSE_ROBUST_LOWQ_W_API=0.9`
+
+## 6. 日志指标
+
+粗筛阶段会输出以下关键指标：
+
+- `coarse_total_groups`
+- `coarse_candidate_groups`
+- `coarse_prune_ratio`
+- `coarse_elapsed_ms`
+- `fallback_triggered`
+- `api_tokens_before / api_tokens_after`
+- `string_quality`
+- `adaptive_weights`
+- `rerank_keep_count`
+
+示例：
+
+```text
+[libhunter] Coarse filter: 460 -> 92 groups (pruned 80.0%), 240ms
+```
+
+## 7. 依赖
+
+粗筛使用：
+
+- `datasketch`（MinHash / LSH）
+- `packaging`（版本排序）
+
+请确保已安装：
+
 ```bash
-cp .env.example .env
+pip3 install -r requirements.txt
 ```
 
-### 2) 构建镜像
-```bash
-docker compose build
-```
+## 8. 与精检关系
 
-### 3) 启动服务
-```bash
-docker compose up -d
-```
+- 首轮粗筛只负责“库族候选召回与裁剪”。
+- 后续 `detect` 精检逻辑和输出格式保持不变。
+- 该设计保证粗筛是前置加速层，不改变核心判定接口。
 
-### 4) 查看服务日志
-```bash
-docker compose logs -f api
-
-docker compose logs -f worker
-```
-
-### 5) 任务流程（最小可用）
-```bash
-# 上传 APK
-curl -F "file=@/home/leejm/Andriod_hunter/inputs/demo.apk" http://127.0.0.1:8000/api/upload
-
-# 提交扫描任务（worker 会调用 python3 main.py --apk ...）
-curl -X POST http://127.0.0.1:8000/api/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"filename":"demo.apk"}'
-
-# 查询任务状态
-curl http://127.0.0.1:8000/api/task/<task_id>
-
-# 查询报告
-curl http://127.0.0.1:8000/api/report?task_id=<task_id>
-```
-
-### 6) 持久化目录
-- `storage/uploads`：上传 APK
-- `storage/reports`：最终 JSON 报告
-- `storage/logs`：API / Worker / 扫描日志
-- `data/phunter_soot_cache`：PHunter 缓存
-- `data/lib_pickles_cache`：LibHunter pickle 缓存
-- `outputs/raw`：保留兼容的扫描中间产物目录
-
-### docker 常用指令：
-``` bash
-# 查看镜像
-docker images
-
-# 查看正在运行的容器
-docker ps
-
-# 查看所有容器
-docker ps -a
-
-# 停掉并删除 compose 启动的容器和网络
-docker compose down
-
-# 连镜像一起删
-docker compose down --rmi all
-
-# 连 volume 也删（最彻底）
-docker compose down --rmi all -v
-```
-
-### 前端如何运行：
-``` bash
-cd frontend
-npm install
-npm run dev
-```
-然后浏览器打开：http://localhost:5173（已和docker内的后端连通）
-
-### “不构建镜像，热同步代码到容器”流程：
-``` bash
-# 1) 把本地文件拷进容器（单文件）
-docker compose cp engine/detector.py worker:/app/engine/detector.py
-docker compose cp backend/celery_app.py worker:/app/backend/celery_app.py
-
-# 2) 如果 API 也会 import 到这些代码，也同步一份
-docker compose cp engine/detector.py api:/app/engine/detector.py
-docker compose cp backend/celery_app.py api:/app/backend/celery_app.py
-
-# 3) 目录也可以直接拷（整目录覆盖）
-docker compose cp LibHunter/module worker:/app/LibHunter/
-docker compose cp LibHunter/module api:/app/LibHunter/
-
-# 4) 重启对应服务让新代码生效
-docker compose restart worker
-docker compose restart api
-
-```
-验证是否已同步成功：
-```bash
-docker compose exec -T worker sh -lc "sed -n '1,80p' /app/engine/detector.py"
-docker compose exec -T worker sh -lc "sed -n '1,80p' /app/backend/celery_app.py"
-
-```
-### 缺点（等最终版代码改完后，还是需要重新构建镜像，以上指令只不过是快速打补丁的方式）
-docker compose cp 是“热补丁”，不需要 build。
-这类修改在“容器被重建”后会丢（比如 down/up --build 或重建容器）。
-哪个服务执行这段代码，就要同步到哪个服务（这里主要是 worker，有时 api 也要同步）。
-
-## **新增 PHunter 预热模式**
-支持模板预热与 APK 预热，不跑完整检测流程即可提前生成缓存。
-相关入口在 main.py / engine/detector.py / PHunter signTPL.MainClass（--prewarmOnly、--prewarmAPKOnly）。
-
-### **缓存体系重构为“上层优先，失败回退”**
-默认优先使用 binary_analysis / apk_analysis（分析结果缓存）；
-仅当上层失败时才回退到底层 binary（Soot 产物链路）。
-这样真实 APK 检测时更偏算法层执行，减少重复反编译。
-
-### **缓存目录规范化**
-采用 _aliases + soot_cache_hash 结构，按内容 hash 组织缓存，支持稳定命中与别名映射。
-缓存命中通过文件 hash + 别名映射实现，兼容“不同文件名同内容”与“同文件名更新覆盖映射”的场景。
-避免后续真实 APK 与 CVE 模板无法对齐。
-
-### **终端命令**
-```
-1）正常检测 APK（自动复用 LibHunter + PHunter 缓存）：
-$ python3 main.py --apk /home/leejm/Andriod_hunter/inputs/demo.apk
-```
-```
-2）全量预热 PHunter（来源：TPL-CVEs）：（后续可删除）
-$ python3 main.py --prewarm-phunter --prewarm-source tpl_cves
-```
-```
-3） 全量预热 PHunter（来源：cve_kb.json）：
-$ python3 main.py --prewarm-phunter --prewarm-source cve_kb
-```
-```
-4） 只预热某个 APK 的 PHunter 缓存（apk_analysis）：
-$ python3 main.py --prewarm-apk /home/leejm/Andriod_hunter/inputs/demo.apk
-```
-```
-5） 单条手工预热（仅模板 pre/post，不跑 patch 检测）：
-$ java -jar PHunter/PHunter.jar \
-  --preTPL /path/to/pre.jar \
-  --postTPL /path/to/post.jar \
-  --androidJar PHunter/android-31/android.jar \
-  --cacheDir data/phunter_soot_cache \
-  --cacheMode readwrite \
-  --prewarmOnly
-```
-```
-6） 单条手工预热（仅 APK 缓存，不跑模板/patch）：
-$ java -jar PHunter/PHunter.jar \
-  --targetAPK /path/to/app.apk \
-  --androidJar PHunter/android-31/android.jar \
-  --cacheDir data/phunter_soot_cache \
-  --cacheMode readwrite \
-  --prewarmAPKOnly
-```
-
-### **可选环境变量（按需）**
-```
-预热超时（秒），大条目建议调大：
-$ export PHUNTER_PREWARM_TIMEOUT=7200
-```
-```
-缓存模式：off | readonly | readwrite
-$ export PHUNTER_CACHE_MODE=readwrite
-```
-```
-方法级预算（防极端路径爆炸）
-$ export PHUNTER_DIGEST_METHOD_BUDGET_MS=30000
-$ export PHUNTER_DIGEST_METHOD_BUDGET_NODES
-```
-
-### **对应代码文件**
-src/symbolicExec/MethodDigest.java（状态去重 + 方法预算裁剪）
-src/analyze/BinaryAnalyzer.java
-src/analyze/MethodAttr.java
-src/treeEditDistance/node/PredicateNodeData.java
-src/analyze/AnalyzerCacheSupport.java（新文件）
-src/analyze/SootCacheSupport.java（新文件）
-src/signTPL/MainClass.java（预热参数相关）
-engine/detector.py（修复 .aar -> .jar 缓存就绪误判）
----
