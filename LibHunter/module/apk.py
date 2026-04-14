@@ -2,6 +2,7 @@
 import datetime
 import hashlib
 import os
+import re
 
 from androguard.core.analysis.analysis import Analysis, DVMBasicBlock, MethodAnalysis
 from androguard.core.bytecodes.apk import APK
@@ -22,6 +23,29 @@ def _get_method_full_name(method: EncodedMethod) -> str:
     except Exception:
         return str(method)
 
+
+def _extract_invoke_api_token(raw_line: str) -> str:
+    if not raw_line:
+        return ""
+    invoke_info = raw_line[raw_line.find("L"):] if "L" in raw_line else raw_line
+    normalized = (
+        invoke_info.replace("->", ".")
+        .replace("/", ".")
+        .replace(";", ".")
+        .replace("(", ".")
+        .replace(")", ".")
+        .replace("$", ".")
+        .lower()
+    )
+    parts = [p for p in re.findall(r"[a-z0-9_]+", normalized) if p]
+    if len(parts) < 2:
+        return ""
+    if parts[0].startswith("l") and len(parts[0]) > 1:
+        head = parts[0][1:]
+        if head in {"java", "javax", "android", "kotlin", "org", "com", "dalvik"}:
+            parts[0] = head
+    return ".".join(parts[:4])
+
 class Apk(object):
 
     def __init__(self, apk_path, logger):
@@ -29,6 +53,7 @@ class Apk(object):
         self.apk_name = None  
 
         self.classes_dict = dict()  # Record all the class information in the apk
+        self.external_api_tokens = set()
         self.app_filter = dict()
         self.android_jars = self.read_android_jars()
         self.condition_jump_ins = [
@@ -374,6 +399,10 @@ class Apk(object):
                     raw_string = ins.get_raw_string()
                     if raw_string != "":
                         strings.append(raw_string)
+                elif name.startswith("invoke"):
+                    api_token = _extract_invoke_api_token(ins.get_output())
+                    if api_token:
+                        self.external_api_tokens.add(api_token)
 
             # Determine the block to traverse based on the conditional branch
             last_ins = list(block.get_instructions())[-1]
