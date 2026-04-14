@@ -29,6 +29,29 @@ def _get_method_full_name(method: EncodedMethod) -> str:
         return str(method)
 
 
+def _extract_invoke_api_token(raw_line: str) -> str:
+    if not raw_line:
+        return ""
+    invoke_info = raw_line[raw_line.find("L"):] if "L" in raw_line else raw_line
+    normalized = (
+        invoke_info.replace("->", ".")
+        .replace("/", ".")
+        .replace(";", ".")
+        .replace("(", ".")
+        .replace(")", ".")
+        .replace("$", ".")
+        .lower()
+    )
+    parts = [p for p in re.findall(r"[a-z0-9_]+", normalized) if p]
+    if len(parts) < 2:
+        return ""
+    if parts[0].startswith("l") and len(parts[0]) > 1:
+        head = parts[0][1:]
+        if head in {"java", "javax", "android", "kotlin", "org", "com", "dalvik"}:
+            parts[0] = head
+    return ".".join(parts[:4])
+
+
 class ThirdLib(object):
 
     def __init__(self, lib_path, logger):
@@ -38,6 +61,7 @@ class ThirdLib(object):
 
         self.lib_opcode_num = int()
         self.classes_dict = dict()
+        self.external_api_tokens = set()
         self.nodes_dict = dict()
         self.lib_method_num = int()
         # self.invoke_other_methodes = set()  
@@ -535,6 +559,9 @@ class ThirdLib(object):
                 cur_instructions.append(ins.get_op_value())
                 if name.startswith("invoke"):
                     line = ins.get_output()
+                    api_token = _extract_invoke_api_token(line)
+                    if api_token:
+                        self.external_api_tokens.add(api_token)
                     invoke_info = line[line.find("L"):]
                     method_info = invoke_info.replace("->", " ").replace("(", " (")
 
