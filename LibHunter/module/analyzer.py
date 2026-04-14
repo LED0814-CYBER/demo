@@ -1021,12 +1021,36 @@ def _log_coarse_metrics(logger, metrics: dict):
     prune_ratio = metrics.get("coarse_prune_ratio", 0.0)
     elapsed_ms = metrics.get("coarse_elapsed_ms", 0)
     fallback_triggered = metrics.get("fallback_triggered", False)
+    api_tokens_before = metrics.get("api_tokens_before", 0)
+    api_tokens_after = metrics.get("api_tokens_after", 0)
+    rerank_keep_count = metrics.get("rerank_keep_count", 0)
+    string_quality = metrics.get("string_quality", {}) or {}
+    adaptive_weights = metrics.get("adaptive_weights", {}) or {}
 
     logger.info("[libhunter] coarse_total_groups=%d", total_groups)
     logger.info("[libhunter] coarse_candidate_groups=%d", candidate_groups)
     logger.info("[libhunter] coarse_prune_ratio=%.4f", prune_ratio)
     logger.info("[libhunter] coarse_elapsed_ms=%d", elapsed_ms)
     logger.info("[libhunter] fallback_triggered=%s", fallback_triggered)
+    logger.info("[libhunter] api_tokens_before=%d", api_tokens_before)
+    logger.info("[libhunter] api_tokens_after=%d", api_tokens_after)
+    logger.info("[libhunter] rerank_keep_count=%d", rerank_keep_count)
+    if string_quality:
+        logger.info(
+            "[libhunter] string_quality=q_str=%.4f low=%s long_ratio=%.4f entropy_ratio=%.4f printable_ratio=%.4f",
+            float(string_quality.get("q_str", 0.0)),
+            bool(string_quality.get("is_low_quality", False)),
+            float(string_quality.get("long_ratio", 0.0)),
+            float(string_quality.get("high_entropy_ratio", 0.0)),
+            float(string_quality.get("printable_ratio", 0.0)),
+        )
+    if adaptive_weights:
+        logger.info(
+            "[libhunter] adaptive_weights=w_str=%.4f w_api=%.4f smooth=%s",
+            float(adaptive_weights.get("w_str", 0.0)),
+            float(adaptive_weights.get("w_api", 0.0)),
+            bool(adaptive_weights.get("smooth", False)),
+        )
     logger.info(
         "[libhunter] Coarse filter: %d -> %d groups (pruned %.1f%%), %dms",
         total_groups,
