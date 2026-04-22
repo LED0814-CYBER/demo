@@ -35,6 +35,14 @@ services:
       - ./data:/app/data
       - ./storage:/app/storage
       - ./outputs:/app/outputs
+      - ./app.py:/app/app.py
+      - ./main.py:/app/main.py
+      - ./config.py:/app/config.py
+      - ./backend:/app/backend
+      - ./engine:/app/engine
+      - ./utils:/app/utils
+      - ./LibHunter:/app/LibHunter
+      - ./PHunter:/app/PHunter
     depends_on:
       # api 要等 redis 和 postgres 都健康后再启动
       redis:
