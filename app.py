@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +20,8 @@ from backend.models import AnalysisTask, User, VulnerabilityReport
 from backend.settings import settings
 from backend.tasks import run_analysis_task
 from config import ensure_runtime_dirs
+
+logger = logging.getLogger(__name__)
 
 
 class AnalyzeRequest(BaseModel):
@@ -320,6 +324,9 @@ def get_report(
 @app.websocket("/api/logs")
 async def websocket_logs(websocket: WebSocket, task_id: Optional[str] = None) -> None:
     await websocket.accept()
+    
+    # 设置更长的超时时间
+    websocket.timeout = 120  # 120秒超时
 
     if not task_id:
         await websocket.send_json({"type": "error", "message": "task_id is required"})
@@ -328,9 +335,26 @@ async def websocket_logs(websocket: WebSocket, task_id: Optional[str] = None) ->
 
     offsets: dict[str, int] = {}
     finished_idle_rounds = 0
+    last_heartbeat_time = time.time()
+    heartbeat_interval = 30  # 30秒发送一次心跳
 
     try:
         while True:
+            current_time = time.time()
+            
+            # 发送心跳包
+            if current_time - last_heartbeat_time > heartbeat_interval:
+                try:
+                    await websocket.send_json({
+                        "type": "heartbeat", 
+                        "timestamp": current_time,
+                        "task_id": task_id
+                    })
+                    last_heartbeat_time = current_time
+                except Exception as e:
+                    logger.warning(f"Heartbeat failed for task {task_id}: {e}")
+                    break
+
             with SessionLocal() as db:
                 task = db.get(AnalysisTask, task_id)
 
@@ -346,6 +370,7 @@ async def websocket_logs(websocket: WebSocket, task_id: Optional[str] = None) ->
                         "task_id": task.id,
                         "apk_name": task.apk_name,
                         "status": task.status,
+                        "timestamp": time.time(),
                     }
                 )
 
@@ -374,21 +399,28 @@ async def websocket_logs(websocket: WebSocket, task_id: Optional[str] = None) ->
 
                 had_new_data = True
                 for line in chunk.splitlines():
-                    await websocket.send_json(
-                        {
-                            "type": "log",
-                            "task_id": task.id,
-                            "file": log_file.name,
-                            "message": line,
-                        }
-                    )
+                    try:
+                        await websocket.send_json(
+                            {
+                                "type": "log",
+                                "task_id": task.id,
+                                "file": log_file.name,
+                                "message": line,
+                                "timestamp": time.time(),
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to send log line for task {task_id}: {e}")
+                        # 如果发送失败，重新设置offset以便下次重试
+                        offsets[key] = prev
+                        raise
 
             if task.status in {"completed", "failed"}:
                 if had_new_data:
                     finished_idle_rounds = 0
                 else:
                     finished_idle_rounds += 1
-                if finished_idle_rounds >= 2:
+                if finished_idle_rounds >= 3:  # 增加等待轮次
                     await websocket.send_json(
                         {
                             "type": "done",
@@ -396,12 +428,33 @@ async def websocket_logs(websocket: WebSocket, task_id: Optional[str] = None) ->
                             "status": task.status,
                             "error": task.error_message,
                             "report_path": task.report_path,
+                            "timestamp": time.time(),
                         }
                     )
+                    # 等待客户端确认
+                    await asyncio.sleep(1)
                     break
 
-            await asyncio.sleep(0.8)
+            # 根据任务状态调整轮询间隔
+            if task.status in {"running", "queued"}:
+                await asyncio.sleep(0.5)  # 运行中任务快速轮询
+            else:
+                await asyncio.sleep(2.0)  # 已完成任务慢速轮询
+                
     except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for task {task_id}")
+        return
+    except Exception as e:
+        logger.error(f"WebSocket error for task {task_id}: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error", 
+                "message": f"Internal server error: {str(e)}",
+                "task_id": task_id
+            })
+            await websocket.close(code=1011)
+        except:
+            pass
         return
 
 
