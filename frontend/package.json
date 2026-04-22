@@ -9,6 +9,7 @@
     "preview": "vite preview --host 0.0.0.0 --port 4173"
   },
   "dependencies": {
+    "@antv/g6": "^5.1.0",
     "echarts": "^6.0.0",
     "lucide-react": "^0.542.0",
     "react": "^18.3.1",
