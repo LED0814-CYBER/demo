@@ -41,8 +41,14 @@ async def analyze_apk_async(apk_path: str | Path, *, print_summary: bool = True)
     start_time = time.time()
     scanner = AndroidVulnScanner(target_apk)
 
-    # Run heavy synchronous scan in a worker thread so async callers are not blocked.
-    final_report = await asyncio.to_thread(scanner.scan)
+    # 直接同步调用scan方法，避免asyncio.to_thread在子进程中出现问题
+    try:
+        final_report = scanner.scan()  # 同步调用
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Scan failed for APK {target_apk}: {e}")
+        raise
 
     report_file = save_final_report(scanner.apk_info["name"], final_report)
     elapsed_time = time.time() - start_time
